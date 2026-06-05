@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import requests
+import time
 from time import sleep
 
 st.set_page_config(
@@ -20,59 +21,107 @@ usernames_text = st.text_area(
     height=120
 )
 
+
+# -----------------------------
+# Wat error codes van Discogs zelf...
+# -----------------------------
+def request_with_retry(url, headers, max_retries=5):
+    for attempt in range(max_retries):
+        response = requests.get(url, headers=headers)
+
+        if response.status_code == 200:
+            return response
+
+        # Rate limit
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", 2))
+            time.sleep(retry_after)
+            continue
+
+        # Temporary server issues
+        if response.status_code in [500, 502, 503, 504]:
+            time.sleep(2 ** attempt)
+            continue
+
+        raise Exception(f"Request failed: {response.status_code} - {response.text}")
+
+    raise Exception(f"Max retries exceeded for URL: {url}")
+
+
+# -----------------------------
+# Get all collection folders
+# -----------------------------
+def get_folders(username, headers):
+    url = f"https://api.discogs.com/users/{username}/collection/folders"
+    response = request_with_retry(url, headers)
+    data = response.json()
+
+    return [folder["id"] for folder in data.get("folders", [])]
+
+
+# -----------------------------
+# Fetch full collection (ALL folders)
+# -----------------------------
 def get_collection(username, headers):
 
     releases = []
-    page = 1
-    per_page = 100
+    folder_ids = get_folders(username, headers)
 
-    while True:
+    for folder_id in folder_ids:
 
-        url = (
-            f"https://api.discogs.com/users/"
-            f"{username}/collection/folders/0/releases"
-            f"?page={page}&per_page={per_page}"
-        )
+        page = 1
+        per_page = 100
 
-        response = requests.get(url, headers=headers)
+        while True:
 
-        if response.status_code != 200:
-            raise Exception(f"Failed to fetch {username}: {response.status_code}")
+            url = (
+                f"https://api.discogs.com/users/{username}/collection/folders/"
+                f"{folder_id}/releases?page={page}&per_page={per_page}"
+            )
 
-        data = response.json()
+            response = request_with_retry(url, headers)
+            data = response.json()
 
-        for item in data["releases"]:
+            for item in data.get("releases", []):
 
-            info = item["basic_information"]
+                info = item["basic_information"]
 
-            artists = info.get("artists", [])
+                artists = info.get("artists", [])
 
-            artist_names = [
-                artist.get("name", "").replace(" (2)", "")
-                for artist in artists
-            ]
+                artist_names = [
+                    artist.get("name", "").replace(" (2)", "")
+                    for artist in artists
+                ]
 
-            releases.append({
-                "release_id": info["id"],
-                "artist": " / ".join(artist_names),
-                "title": info["title"],
-                "thumb": info.get("thumb", "")
-            })
+                releases.append({
+                    "release_id": info["id"],
+                    "artist": " / ".join(artist_names),
+                    "title": info["title"],
+                    "thumb": info.get("thumb", "")
+                })
 
-        if page >= data["pagination"]["pages"]:
-            break
+            pagination = data.get("pagination", {})
+            pages = pagination.get("pages", 1)
 
-        page += 1
-        sleep(1)
+            if page >= pages:
+                break
+
+            page += 1
+            sleep(1)
+
 
     return releases
 
 
+# -----------------------------
+# Session state, zooi in cache opslaan want sneller
+# -----------------------------
 if "df" not in st.session_state:
     st.session_state.df = None
 
 if "usernames" not in st.session_state:
     st.session_state.usernames = []
+
 
 headers = {}
 
@@ -85,13 +134,16 @@ with top_col2:
     download_placeholder = st.empty()
 
 
-
 usernames = [
     u.strip()
     for u in usernames_text.splitlines()
     if u.strip()
 ]
 
+
+# -----------------------------
+# Main execution
+# -----------------------------
 if run:
 
     if not token:
@@ -108,11 +160,9 @@ if run:
     }
 
     progress = st.progress(0)
-
     collections = {}
 
     try:
-
         for i, username in enumerate(usernames):
 
             st.write(f"Fetching **{username}**...")
@@ -152,7 +202,6 @@ if run:
             rows.append(row)
 
         df = pd.DataFrame(rows)
-
         df = df.sort_values(["Artist", "Title"]).reset_index(drop=True)
 
         st.session_state.df = df
@@ -163,6 +212,10 @@ if run:
     except Exception as e:
         st.error(str(e))
 
+
+# -----------------------------
+# Output section
+# -----------------------------
 df = st.session_state.df
 
 if df is not None and len(st.session_state.usernames) > 0:
@@ -253,6 +306,7 @@ if df is not None and len(st.session_state.usernames) > 0:
         st.dataframe(shared_df[["Artist", "Title"]], use_container_width=True)
 
     st.subheader("💿 Releases")
+
     search = st.text_input("Search artist or title", value="", label_visibility="collapsed")
 
     filtered_df = df.copy()
@@ -284,4 +338,4 @@ if df is not None and len(st.session_state.usernames) > 0:
             st.progress(len(owners) / len(usernames))
 
     if len(filtered_df) > max_cards:
-        st.info(f"Displaying first {max_cards} releases. Use search to narrow results.")
+        st.info(f"Displaying first {max_cards} releases.")
